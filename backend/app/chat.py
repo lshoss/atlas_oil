@@ -1,37 +1,48 @@
-"""Chat com a API da Anthropic. Por enquanto responde só com o conhecimento do modelo."""
+"""Agente Barril — IBM Bob Inference API (OpenAI-compatible).
+
+Fluxo de cada turno:
+  1. Envia as mensagens + ferramentas disponíveis ao modelo (sem stream).
+  2. Se o modelo pedir ferramentas, executa todas em paralelo, acrescenta os
+     resultados ao histórico e volta ao passo 1.
+  3. Quando o modelo responder com texto puro (finish_reason == "stop" ou
+     "length"), transmite esse texto como SSE para o cliente.
+
+O número máximo de rodadas de ferramentas (MAX_TOOL_ROUNDS) evita loops infinitos.
+"""
 
 import json
 import logging
 from collections.abc import AsyncIterator, Sequence
 from datetime import date
+from typing import Any
 
-import anthropic
+import asyncio
 import httpx2
+import openai
 
 from .schemas import ChatMessage
+from .tools import TOOL_DEFINITIONS, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
-# Inclui o raciocínio interno do modelo, além do texto da resposta.
 MAX_TOKENS = 2048
 REQUEST_TIMEOUT_SECONDS = 60
+MAX_TOOL_ROUNDS = 5  # ciclos de tool_call antes de forçar resposta
 
 SYSTEM_PROMPT = """Você é o Agente Barril, um analista que explica o mercado de petróleo \
 para um investidor pessoa física brasileiro, sem jargão.
 
 Hoje é {today}.
 
-Seu limite: você responde apenas com o seu conhecimento geral. Você não tem acesso a \
-cotações, notícias, gráficos ou à carteira do usuário, nem ao que aparece no painel dele.
+Você tem acesso a ferramentas que buscam dados em tempo real: cotações atuais, histórico \
+de preços e notícias recentes do setor. Sempre que a pergunta envolver preços, variações, \
+tendências ou eventos recentes, use as ferramentas antes de responder — nunca invente números.
 
 Como responder:
 - Escreva em português do Brasil, em até três parágrafos curtos.
 - Use texto simples, sem Markdown: nada de asteriscos, títulos ou tabelas.
 - Explique cada termo técnico com palavras simples.
-- Nunca invente preços, datas ou notícias.
-- Se a pergunta depender de dados atuais, diga que você não os tem e indique os cards e \
-as notícias do painel. Depois explique o que ajuda a interpretar esses dados.
-- Se citar um número de memória, diga de que época ele é.
+- Se citar um preço ou data, indique que veio dos dados do painel.
 - Não diga para comprar ou vender um ativo. Explique os fatores para a pessoa decidir."""
 
 
@@ -44,24 +55,18 @@ def _event(event_type: str, **fields: object) -> str:
     return f"data: {payload}\n\n"
 
 
-def _api_error_body(error: anthropic.APIStatusError) -> dict[str, object]:
-    body = error.body
-    detail = body.get("error") if isinstance(body, dict) else None
-    return detail if isinstance(detail, dict) else {}
-
-
-def describe_error(error: anthropic.APIError) -> str:
-    if isinstance(error, anthropic.AuthenticationError):
-        return "A Anthropic recusou a chave. Confira ANTHROPIC_API_KEY em backend/.env."
-    if isinstance(error, anthropic.RateLimitError):
-        return "O limite de uso da Anthropic foi atingido. Tente de novo em instantes."
-    if isinstance(error, anthropic.APIStatusError):
-        # Erros no meio do streaming chegam com status HTTP 200.
-        body = _api_error_body(error)
-        if body.get("type") == "overloaded_error":
-            return "A Anthropic está sobrecarregada. Tente de novo em instantes."
-        return f"Erro da Anthropic: {body.get('message') or error.message}"
-    return "Não consegui falar com a Anthropic. Confira sua conexão e tente de novo."
+def describe_error(error: Exception) -> str:
+    if isinstance(error, openai.AuthenticationError):
+        return "O IBM Bob recusou a chave. Confira BOB_API_KEY em backend/.env."
+    if isinstance(error, openai.RateLimitError):
+        return "O limite de uso do IBM Bob foi atingido. Tente de novo em instantes."
+    if isinstance(error, openai.APIStatusError):
+        body = error.response.json() if error.response is not None else {}
+        message = (body.get("error") or {}).get("message") or str(error)
+        return f"Erro do IBM Bob: {message}"
+    if isinstance(error, openai.APIConnectionError):
+        return "Não consegui falar com o IBM Bob. Confira sua conexão e tente de novo."
+    return f"Erro inesperado ao chamar o IBM Bob: {error}"
 
 
 class ChatService:
@@ -69,12 +74,14 @@ class ChatService:
         self,
         api_key: str,
         model: str,
+        base_url: str = "",
         http_client: httpx2.AsyncClient | None = None,
     ) -> None:
         self._model = model
         self._client = (
-            anthropic.AsyncAnthropic(
+            openai.AsyncOpenAI(
                 api_key=api_key,
+                base_url=base_url or None,
                 timeout=REQUEST_TIMEOUT_SECONDS,
                 http_client=http_client,
             )
@@ -86,32 +93,98 @@ class ChatService:
     def configured(self) -> bool:
         return self._client is not None
 
-    async def stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[str]:
+    async def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        executor: ToolExecutor | None = None,
+    ) -> AsyncIterator[str]:
         """Gera eventos SSE: vários `delta`, seguidos de um `done` ou um `error`."""
         assert self._client is not None
-        has_text = False
-        try:
-            async with self._client.messages.stream(
-                model=self._model,
-                max_tokens=MAX_TOKENS,
-                system=system_prompt(),
-                messages=[message.model_dump() for message in messages],
-                output_config={"effort": "low"},
-            ) as stream:
-                async for text in stream.text_stream:
-                    has_text = True
-                    yield _event("delta", text=text)
-                final = await stream.get_final_message()
-        except anthropic.APIError as error:
-            logger.warning("Falha na chamada à Anthropic: %s", error)
-            yield _event("error", message=describe_error(error))
-            return
 
-        if not has_text:
-            logger.warning("Resposta sem texto. stop_reason=%s", final.stop_reason)
-            yield _event("error", message="O modelo não gerou uma resposta. Tente reformular.")
-            return
-        yield _event("done", truncated=final.stop_reason == "max_tokens")
+        # Histórico de mensagens que será crescendo com os tool_calls e seus resultados
+        history: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt()},
+            *[msg.model_dump() for msg in messages],
+        ]
+
+        tools = TOOL_DEFINITIONS if executor is not None else []
+
+        try:
+            for _round in range(MAX_TOOL_ROUNDS + 1):
+                # Pedimos ao modelo que responda ou chame ferramentas (sem streaming
+                # durante a fase de tool-calling para simplificar o loop).
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    max_tokens=MAX_TOKENS,
+                    messages=history,
+                    tools=tools or openai.NOT_GIVEN,
+                    tool_choice="auto" if tools else openai.NOT_GIVEN,
+                    stream=False,
+                )
+
+                choice = response.choices[0]
+                finish_reason = choice.finish_reason
+                msg = choice.message
+
+                # --- Modelo quer chamar ferramentas ---
+                if finish_reason == "tool_calls" and msg.tool_calls and executor is not None:
+                    # Acrescenta a mensagem do assistente (com tool_calls) ao histórico.
+                    # Usamos um dict explícito para evitar campos None que alguns endpoints rejeitam.
+                    history.append({
+                        "role": "assistant",
+                        "content": msg.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in msg.tool_calls
+                        ],
+                    })
+
+                    # Executa todas as ferramentas em paralelo
+                    tool_results = await asyncio.gather(
+                        *(executor.run(tc.function.name, tc.function.arguments) for tc in msg.tool_calls)
+                    )
+
+                    # Acrescenta os resultados ao histórico
+                    for tc, result in zip(msg.tool_calls, tool_results):
+                        history.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+
+                    # Notifica o cliente que o agente está buscando dados
+                    yield _event("tool_call", tools=[tc.function.name for tc in msg.tool_calls])
+                    continue  # próxima rodada
+
+                # --- Modelo devolveu resposta de texto ---
+                text = msg.content or ""
+                if not text:
+                    logger.warning("Resposta sem texto. finish_reason=%s", finish_reason)
+                    yield _event("error", message="O modelo não gerou uma resposta. Tente reformular.")
+                    return
+
+                # Transmite o texto em blocos (simula streaming para o cliente)
+                CHUNK = 40
+                for i in range(0, len(text), CHUNK):
+                    yield _event("delta", text=text[i : i + CHUNK])
+
+                yield _event("done", truncated=finish_reason == "length")
+                return
+
+            # Excedeu MAX_TOOL_ROUNDS sem resposta final
+            logger.warning("Agente excedeu %d rodadas de ferramentas", MAX_TOOL_ROUNDS)
+            yield _event("error", message="O agente não conseguiu formular uma resposta. Tente reformular.")
+
+        except openai.APIError as error:
+            logger.warning("Falha na chamada ao IBM Bob: %s", error)
+            yield _event("error", message=describe_error(error))
 
     async def aclose(self) -> None:
         if self._client is not None:

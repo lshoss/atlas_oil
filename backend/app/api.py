@@ -41,7 +41,7 @@ async def news(request: Request, limit: Annotated[int, Query(ge=1, le=50)] = 20)
 async def chat(request: Request, body: ChatRequest) -> StreamingResponse:
     service = request.app.state.chat
     if not service.configured:
-        raise HTTPException(503, "Configure ANTHROPIC_API_KEY em backend/.env para usar o chat.")
+        raise HTTPException(503, "Configure BOB_API_KEY em backend/.env para usar o chat.")
     return StreamingResponse(
         service.stream(body.messages),
         media_type="text/event-stream",

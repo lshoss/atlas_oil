@@ -24,7 +24,7 @@ def create_app(
         client = http or httpx2.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True)
         app.state.market = MarketService(client)
         app.state.news = NewsService(client, config.finnhub_api_key)
-        app.state.chat = chat or ChatService(config.anthropic_api_key, config.anthropic_model)
+        app.state.chat = chat or ChatService(config.bob_api_key, config.bob_model, config.bob_base_url)
         yield
         await app.state.chat.aclose()
         await client.aclose()

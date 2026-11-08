@@ -9,8 +9,9 @@ ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
-    anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-5-5"
+    bob_api_key: str = ""
+    bob_model: str = "premium-ide"
+    bob_base_url: str = ""
     finnhub_api_key: str = ""
 
 

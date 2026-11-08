@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from .cache import UpstreamError
 from .market import ASSETS_BY_SYMBOL
 from .schemas import ChatRequest, HistoryResponse, NewsResponse, QuotesResponse, RangeKey
+from .tools import ToolExecutor
 
 router = APIRouter(prefix="/api")
 
@@ -42,8 +43,9 @@ async def chat(request: Request, body: ChatRequest) -> StreamingResponse:
     service = request.app.state.chat
     if not service.configured:
         raise HTTPException(503, "Configure BOB_API_KEY em backend/.env para usar o chat.")
+    executor = ToolExecutor(request.app.state.market, request.app.state.news)
     return StreamingResponse(
-        service.stream(body.messages),
+        service.stream(body.messages, executor=executor),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

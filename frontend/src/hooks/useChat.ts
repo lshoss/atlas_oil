@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { streamChat } from '../lib/api';
-import type { ApiMessage } from '../lib/types';
+import type { ApiMessage, UIContext, UiActionEvent } from '../lib/types';
 
 const STORAGE_KEY = 'barril.chat.v1';
 const MAX_HISTORY = 20;
@@ -52,11 +52,22 @@ function createEntry(role: ChatEntry['role'], content: string, truncated = false
   return { id, role, content, ...(truncated && { truncated }) };
 }
 
-export function useChat() {
+export interface UseChatOptions {
+  context?: UIContext;
+  onUiAction?: (event: UiActionEvent) => void;
+}
+
+export function useChat({ context, onUiAction }: UseChatOptions = {}) {
   const [messages, setMessages] = useState<ChatEntry[]>(loadMessages);
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // Keep latest callbacks in refs so the answer callback never goes stale
+  const contextRef = useRef(context);
+  const onUiActionRef = useRef(onUiAction);
+  useEffect(() => { contextRef.current = context; }, [context]);
+  useEffect(() => { onUiActionRef.current = onUiAction; }, [onUiAction]);
+
   const streaming = draft !== null;
 
   useEffect(() => saveMessages(messages), [messages]);
@@ -73,10 +84,12 @@ export function useChat() {
     try {
       const { truncated } = await streamChat(
         toApiMessages(history),
+        contextRef.current,
         (delta) => {
           text += delta;
           setDraft(text);
         },
+        (event) => onUiActionRef.current?.(event),
         controller.signal,
       );
       setMessages([...history, createEntry('assistant', text, truncated)]);

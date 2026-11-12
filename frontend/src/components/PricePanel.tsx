@@ -13,8 +13,13 @@ function periodChange(points: PricePoint[]): number | null {
   return (points[points.length - 1].close / points[0].close - 1) * 100;
 }
 
-export function PricePanel({ symbol }: { symbol: string }) {
-  const [range, setRange] = useState<RangeKey>('30d');
+interface PricePanelProps {
+  symbol: string;
+  range: RangeKey;
+  onRangeChange: (range: RangeKey) => void;
+}
+
+export function PricePanel({ symbol, range, onRangeChange }: PricePanelProps) {
   const load = useCallback(
     (signal: AbortSignal) => fetchHistory(symbol, range, signal),
     [symbol, range],
@@ -53,7 +58,7 @@ export function PricePanel({ symbol }: { symbol: string }) {
               key={option}
               type="button"
               aria-pressed={option === range}
-              onClick={() => setRange(option)}
+              onClick={() => onRangeChange(option)}
             >
               {option}
             </button>

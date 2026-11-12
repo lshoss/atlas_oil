@@ -45,7 +45,7 @@ async def chat(request: Request, body: ChatRequest) -> StreamingResponse:
         raise HTTPException(503, "Configure BOB_API_KEY em backend/.env para usar o chat.")
     executor = ToolExecutor(request.app.state.market, request.app.state.news)
     return StreamingResponse(
-        service.stream(body.messages, executor=executor),
+        service.stream(body.messages, executor=executor, context=body.context),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

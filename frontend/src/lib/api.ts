@@ -4,6 +4,8 @@ import type {
   NewsResponse,
   QuotesResponse,
   RangeKey,
+  UIContext,
+  UiActionEvent,
 } from './types';
 
 const BACKEND_DOWN = 'O backend não respondeu. Confira se ele está rodando na porta 8000.';
@@ -56,7 +58,9 @@ export function fetchNews(signal: AbortSignal): Promise<NewsResponse> {
 type ChatEvent =
   | { type: 'delta'; text: string }
   | { type: 'done'; truncated: boolean }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'tool_call'; tools: string[] }
+  | UiActionEvent;
 
 export interface ChatOutcome {
   truncated: boolean;
@@ -64,13 +68,15 @@ export interface ChatOutcome {
 
 export async function streamChat(
   messages: ApiMessage[],
+  context: UIContext | undefined,
   onDelta: (text: string) => void,
+  onUiAction: (event: UiActionEvent) => void,
   signal: AbortSignal,
 ): Promise<ChatOutcome> {
   const response = await request('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify({ messages, context }),
     signal,
   });
   if (!response.body) throw new Error('O navegador não recebeu a resposta do chat.');
@@ -94,6 +100,8 @@ export async function streamChat(
       if (event.type === 'delta') onDelta(event.text);
       if (event.type === 'done') return { truncated: event.truncated };
       if (event.type === 'error') throw new Error(event.message);
+      if (event.type === 'ui_action') onUiAction(event);
+      // tool_call events are intentionally ignored in the UI (no visual for now)
     }
   }
 }

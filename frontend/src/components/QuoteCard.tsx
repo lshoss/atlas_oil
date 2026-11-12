@@ -22,9 +22,23 @@ function Change({ value }: { value: number }) {
   );
 }
 
-export function QuoteCard({ quote, selected }: { quote: Quote; selected: boolean }) {
+interface QuoteCardProps {
+  quote: Quote;
+  selected: boolean;
+  onSelect: (symbol: string) => void;
+}
+
+export function QuoteCard({ quote, selected, onSelect }: QuoteCardProps) {
   return (
-    <article className={`quote-card${selected ? ' quote-card--selected' : ''}`}>
+    <article
+      className={`quote-card${selected ? ' quote-card--selected' : ''}`}
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
+      aria-label={`Selecionar ${quote.name}`}
+      onClick={() => onSelect(quote.symbol)}
+      onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onSelect(quote.symbol)}
+    >
       <h3 className="quote-card__symbol">{quote.symbol}</h3>
       <p className="quote-card__name">{quote.name}</p>
       <p className="quote-card__price">

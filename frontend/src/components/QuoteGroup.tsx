@@ -11,6 +11,7 @@ interface QuoteGroupProps {
   icon: ReactNode;
   quotes: Quote[];
   selectedSymbol: string;
+  onSelect: (symbol: string) => void;
 }
 
 export function QuoteGroup({
@@ -20,6 +21,7 @@ export function QuoteGroup({
   icon,
   quotes,
   selectedSymbol,
+  onSelect,
 }: QuoteGroupProps) {
   return (
     <section className={`quote-group quote-group--${tone}`} aria-label={title}>
@@ -30,7 +32,12 @@ export function QuoteGroup({
       </header>
       <div className="quote-group__cards">
         {quotes.map((quote) => (
-          <QuoteCard key={quote.symbol} quote={quote} selected={quote.symbol === selectedSymbol} />
+          <QuoteCard
+            key={quote.symbol}
+            quote={quote}
+            selected={quote.symbol === selectedSymbol}
+            onSelect={onSelect}
+          />
         ))}
         {quotes.length === 0 &&
           Array.from({ length: PLACEHOLDER_CARDS }, (_, index) => (

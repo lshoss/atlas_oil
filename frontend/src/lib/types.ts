@@ -60,3 +60,16 @@ export interface ApiMessage {
   role: 'user' | 'assistant';
   content: string;
 }
+
+export interface UIContext {
+  selected_symbol?: string;
+  selected_range?: RangeKey;
+  active_news_url?: string;
+}
+
+export type UiActionEvent = {
+  type: 'ui_action';
+  action: 'select_chart';
+  symbol: string;
+  range?: RangeKey;
+};

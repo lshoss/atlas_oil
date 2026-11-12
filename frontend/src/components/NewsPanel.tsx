@@ -1,4 +1,4 @@
-import { LuNewspaper } from 'react-icons/lu';
+import { LuMessageSquare, LuNewspaper } from 'react-icons/lu';
 import { usePolling } from '../hooks/usePolling';
 import { fetchNews } from '../lib/api';
 import { timeAgo } from '../lib/format';
@@ -18,7 +18,11 @@ function sourceNote(sources: NewsSourceStatus[]): string | null {
   return null;
 }
 
-export function NewsPanel() {
+interface NewsPanelProps {
+  onAsk: (question: string) => void;
+}
+
+export function NewsPanel({ onAsk }: NewsPanelProps) {
   const { data, error, loading, reload } = usePolling(fetchNews, REFRESH_MS);
   const note = data && sourceNote(data.sources);
 
@@ -55,9 +59,20 @@ export function NewsPanel() {
         <ul className="news-list">
           {data.items.map((item) => (
             <li key={item.title} className="news-item">
-              <a href={item.url} target="_blank" rel="noreferrer">
-                {item.title}
-              </a>
+              <div className="news-item__row">
+                <a href={item.url} target="_blank" rel="noreferrer">
+                  {item.title}
+                </a>
+                <button
+                  type="button"
+                  className="icon-button news-item__ask"
+                  title="Perguntar ao Agente Barril sobre esta notícia"
+                  aria-label={`Perguntar ao agente sobre: ${item.title}`}
+                  onClick={() => onAsk(`O que você sabe sobre esta notícia? "${item.title}"`)}
+                >
+                  <LuMessageSquare aria-hidden="true" />
+                </button>
+              </div>
               <div className="news-item__meta">
                 <span>
                   {item.source} · {timeAgo(item.published_at)}

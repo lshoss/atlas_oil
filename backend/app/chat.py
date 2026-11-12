@@ -2,7 +2,8 @@
 
 Fluxo de cada turno:
   1. Envia as mensagens + ferramentas disponíveis ao modelo (sem stream).
-  2. Se o modelo pedir ferramentas, executa todas em paralelo, acrescenta os
+  2. Se o modelo pedir ferramentas, executa todas em paralelo, drena
+     pending_ui_actions (emitindo eventos SSE "ui_action"), acrescenta os
      resultados ao histórico e volta ao passo 1.
   3. Quando o modelo responder com texto puro (finish_reason == "stop" ou
      "length"), transmite esse texto como SSE para o cliente.
@@ -10,24 +11,24 @@ Fluxo de cada turno:
 O número máximo de rodadas de ferramentas (MAX_TOOL_ROUNDS) evita loops infinitos.
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Sequence
 from datetime import date
 from typing import Any
 
-import asyncio
 import httpx2
 import openai
 
-from .schemas import ChatMessage
+from .schemas import ChatMessage, UIContext
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
 MAX_TOKENS = 2048
 REQUEST_TIMEOUT_SECONDS = 60
-MAX_TOOL_ROUNDS = 5  # ciclos de tool_call antes de forçar resposta
+MAX_TOOL_ROUNDS = 5  # ciclos de tool_call antes de forçar erro
 
 SYSTEM_PROMPT = """Você é o Agente Barril, um analista que explica o mercado de petróleo \
 para um investidor pessoa física brasileiro, sem jargão.
@@ -38,6 +39,10 @@ Você tem acesso a ferramentas que buscam dados em tempo real: cotações atuais
 de preços e notícias recentes do setor. Sempre que a pergunta envolver preços, variações, \
 tendências ou eventos recentes, use as ferramentas antes de responder — nunca invente números.
 
+Você também pode mudar o gráfico principal da interface com a ferramenta set_dashboard_view. \
+Use-a quando o usuário pedir para ver um ativo ou período específico, ou quando sua \
+explicação comparar um ativo diferente do que está visível no painel.
+
 Como responder:
 - Escreva em português do Brasil, em até três parágrafos curtos.
 - Use texto simples, sem Markdown: nada de asteriscos, títulos ou tabelas.
@@ -45,9 +50,29 @@ Como responder:
 - Se citar um preço ou data, indique que veio dos dados do painel.
 - Não diga para comprar ou vender um ativo. Explique os fatores para a pessoa decidir."""
 
+CONTEXT_SUFFIX = """
 
-def system_prompt(today: date | None = None) -> str:
-    return SYSTEM_PROMPT.format(today=(today or date.today()).strftime("%d/%m/%Y"))
+Contexto atual da interface do usuário:
+- Ativo selecionado no gráfico: {symbol}
+- Período do gráfico: {range}
+{news_line}
+Quando o usuário usar referências como "esse ativo", "nesse período" ou "por que caiu?", \
+interprete-as usando esse contexto."""
+
+
+def system_prompt(today: date | None = None, context: UIContext | None = None) -> str:
+    base = SYSTEM_PROMPT.format(today=(today or date.today()).strftime("%d/%m/%Y"))
+    if context is None:
+        return base
+    news_line = (
+        f"- Notícia aberta: {context.active_news_url}\n" if context.active_news_url else ""
+    )
+    suffix = CONTEXT_SUFFIX.format(
+        symbol=context.selected_symbol or "nenhum",
+        range=context.selected_range or "padrão",
+        news_line=news_line,
+    )
+    return base + suffix
 
 
 def _event(event_type: str, **fields: object) -> str:
@@ -97,13 +122,13 @@ class ChatService:
         self,
         messages: Sequence[ChatMessage],
         executor: ToolExecutor | None = None,
+        context: UIContext | None = None,
     ) -> AsyncIterator[str]:
-        """Gera eventos SSE: vários `delta`, seguidos de um `done` ou um `error`."""
+        """Gera eventos SSE: `tool_call`, `ui_action`, `delta`, `done` ou `error`."""
         assert self._client is not None
 
-        # Histórico de mensagens que será crescendo com os tool_calls e seus resultados
         history: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt()},
+            {"role": "system", "content": system_prompt(context=context)},
             *[msg.model_dump() for msg in messages],
         ]
 
@@ -111,8 +136,6 @@ class ChatService:
 
         try:
             for _round in range(MAX_TOOL_ROUNDS + 1):
-                # Pedimos ao modelo que responda ou chame ferramentas (sem streaming
-                # durante a fase de tool-calling para simplificar o loop).
                 response = await self._client.chat.completions.create(
                     model=self._model,
                     max_tokens=MAX_TOKENS,
@@ -128,8 +151,6 @@ class ChatService:
 
                 # --- Modelo quer chamar ferramentas ---
                 if finish_reason == "tool_calls" and msg.tool_calls and executor is not None:
-                    # Acrescenta a mensagem do assistente (com tool_calls) ao histórico.
-                    # Usamos um dict explícito para evitar campos None que alguns endpoints rejeitam.
                     history.append({
                         "role": "assistant",
                         "content": msg.content,
@@ -151,7 +172,7 @@ class ChatService:
                         *(executor.run(tc.function.name, tc.function.arguments) for tc in msg.tool_calls)
                     )
 
-                    # Acrescenta os resultados ao histórico
+                    # Adiciona resultados ao histórico
                     for tc, result in zip(msg.tool_calls, tool_results):
                         history.append({
                             "role": "tool",
@@ -159,8 +180,14 @@ class ChatService:
                             "content": result,
                         })
 
-                    # Notifica o cliente que o agente está buscando dados
+                    # Notifica o cliente das ferramentas chamadas
                     yield _event("tool_call", tools=[tc.function.name for tc in msg.tool_calls])
+
+                    # Drena e emite ações de UI pendentes (ex: set_dashboard_view)
+                    for action in executor.pending_ui_actions:
+                        yield _event("ui_action", **action)
+                    executor.pending_ui_actions.clear()
+
                     continue  # próxima rodada
 
                 # --- Modelo devolveu resposta de texto ---

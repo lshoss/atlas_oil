@@ -67,8 +67,17 @@ class ChatMessage(BaseModel):
     content: str = Field(min_length=1, max_length=12_000)
 
 
+class UIContext(BaseModel):
+    """Estado visível da interface no momento em que o usuário enviou a mensagem."""
+
+    selected_symbol: str | None = None
+    selected_range: RangeKey | None = None
+    active_news_url: str | None = None
+
+
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=40)
+    context: UIContext | None = None
 
     @model_validator(mode="after")
     def conversation_turns(self) -> Self:

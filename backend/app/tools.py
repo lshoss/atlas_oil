@@ -1,4 +1,4 @@
-"""Ferramentas disponíveis para o agente: cotações, histórico e notícias.
+"""Ferramentas disponíveis para o agente: cotações, histórico, notícias e ações de UI.
 
 Cada ferramenta é descrita no formato JSON Schema que o OpenAI tool-calling espera,
 e o ToolExecutor sabe chamar o serviço correspondente e serializar o resultado.
@@ -10,6 +10,8 @@ from typing import Any
 from .market import ASSETS_BY_SYMBOL, MarketService
 from .news import NewsService
 from .schemas import RangeKey
+
+VALID_RANGES: list[RangeKey] = ["7d", "30d", "90d", "1a"]
 
 # ---------------------------------------------------------------------------
 # Definições das ferramentas (enviadas ao modelo em cada chamada)
@@ -45,7 +47,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     },
                     "range": {
                         "type": "string",
-                        "enum": ["7d", "30d", "90d", "1a"],
+                        "enum": VALID_RANGES,
                         "description": "Período: 7d, 30d, 90d ou 1a (um ano).",
                     },
                 },
@@ -76,6 +78,34 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_dashboard_view",
+            "description": (
+                "Muda o ativo e/ou o período exibidos no gráfico principal do painel do usuário. "
+                "Chame esta ferramenta sempre que o usuário pedir explicitamente para ver um ativo "
+                "ou período específico, ou quando sua resposta comparar um ativo diferente do que "
+                "está atualmente selecionado na tela — assim o gráfico acompanha a explicação."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "enum": list(ASSETS_BY_SYMBOL.keys()),
+                        "description": "Símbolo do ativo a exibir: BRENT, WTI, NG, PETR4, PRIO3 ou RECV3.",
+                    },
+                    "range": {
+                        "type": "string",
+                        "enum": VALID_RANGES,
+                        "description": "Período do gráfico: 7d, 30d, 90d ou 1a. Omita para manter o atual.",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
 ]
 
 
@@ -88,6 +118,7 @@ class ToolExecutor:
     def __init__(self, market: MarketService, news: NewsService) -> None:
         self._market = market
         self._news = news
+        self.pending_ui_actions: list[dict[str, Any]] = []
 
     async def run(self, name: str, arguments: str) -> str:
         """Executa a ferramenta `name` com os `arguments` (JSON string) e devolve o resultado."""
@@ -102,7 +133,30 @@ class ToolExecutor:
             return await self._get_history(args)
         if name == "get_news":
             return await self._get_news(args)
+        if name == "set_dashboard_view":
+            return self._set_dashboard_view(args)
         return json.dumps({"error": f"ferramenta desconhecida: {name}"})
+
+    def _set_dashboard_view(self, args: dict[str, Any]) -> str:
+        symbol: str = args.get("symbol", "")
+        range_arg: str | None = args.get("range")
+
+        if symbol not in ASSETS_BY_SYMBOL:
+            return json.dumps({"error": f"símbolo inválido: {symbol}"})
+        if range_arg is not None and range_arg not in VALID_RANGES:
+            return json.dumps({"error": f"período inválido: {range_arg}"})
+
+        action: dict[str, Any] = {"action": "select_chart", "symbol": symbol}
+        if range_arg is not None:
+            action["range"] = range_arg
+        self.pending_ui_actions.append(action)
+
+        asset = ASSETS_BY_SYMBOL[symbol]
+        period_note = f" para o período {range_arg}" if range_arg else ""
+        return json.dumps(
+            {"ok": True, "message": f"Gráfico atualizado para {asset.name}{period_note}."},
+            ensure_ascii=False,
+        )
 
     async def _get_quotes(self) -> str:
         response = await self._market.quotes()

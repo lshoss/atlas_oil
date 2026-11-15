@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     bob_model: str = "premium-ide"
     bob_base_url: str = ""
     finnhub_api_key: str = ""
+    database_url: str = "postgresql+asyncpg://barril:barril@db:5432/barril"
 
 
 @lru_cache

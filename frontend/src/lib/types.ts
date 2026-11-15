@@ -67,9 +67,40 @@ export interface UIContext {
   active_news_url?: string;
 }
 
-export type UiActionEvent = {
-  type: 'ui_action';
-  action: 'select_chart';
+export type UiActionEvent =
+  | { type: 'ui_action'; action: 'select_chart'; symbol: string; range?: RangeKey }
+  | { type: 'ui_action'; action: 'refresh_portfolio' };
+
+export interface PortfolioPosition {
   symbol: string;
-  range?: RangeKey;
-};
+  name: string;
+  quantity: number;
+  avg_price: number;
+  current_price: number | null;
+  currency: string;
+  total_cost: number;
+  current_value: number | null;
+  pnl_value: number | null;
+  pnl_pct: number | null;
+  updated_at: string;
+}
+
+export interface PortfolioResponse {
+  positions: PortfolioPosition[];
+}
+
+export interface TradeRequest {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  quantity: number;
+  price: number;
+}
+
+export interface TradeResponse {
+  symbol: string;
+  side: string;
+  quantity: number;
+  price: number;
+  new_quantity: number;
+  new_avg_price: number;
+}

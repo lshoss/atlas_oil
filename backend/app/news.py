@@ -2,6 +2,8 @@
 
 import asyncio
 import html
+import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -9,9 +11,14 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx2
+from sqlalchemy import insert
 
+from . import db as database
 from .cache import TTLCache, UpstreamError
+from .models import StoredNews
 from .schemas import NewsItem, NewsResponse, NewsSourceStatus
+
+logger = logging.getLogger(__name__)
 
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 # O GDELT indexa traduções em inglês, mesmo para veículos em português.
@@ -168,7 +175,31 @@ class NewsService:
 
         if not groups:
             raise UpstreamError("Nenhuma fonte de notícias respondeu.")
-        return NewsBatch(merge_items(*groups), sources)
+
+        batch = NewsBatch(merge_items(*groups), sources)
+        asyncio.create_task(self._persist(batch.items))
+        return batch
+
+    async def _persist(self, items: list[NewsItem]) -> None:
+        """Upsert das notícias no banco em background (ON CONFLICT DO NOTHING)."""
+        if not items:
+            return
+        rows = [
+            {
+                "url": item.url,
+                "title": item.title,
+                "source": item.source,
+                "published_at": item.published_at,
+                "tags": json.dumps(item.tags, ensure_ascii=False),
+            }
+            for item in items
+        ]
+        try:
+            stmt = insert(StoredNews).values(rows).on_conflict_do_nothing(index_elements=["url"])
+            async with database.get_session() as session:
+                await session.execute(stmt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Falha ao persistir notícias no banco: %s", exc)
 
     async def _fetch_gdelt(self) -> list[NewsItem]:
         params = {

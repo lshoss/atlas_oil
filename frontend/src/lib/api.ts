@@ -2,8 +2,11 @@ import type {
   ApiMessage,
   HistoryResponse,
   NewsResponse,
+  PortfolioResponse,
   QuotesResponse,
   RangeKey,
+  TradeRequest,
+  TradeResponse,
   UIContext,
   UiActionEvent,
 } from './types';
@@ -53,6 +56,20 @@ export function fetchHistory(
 
 export function fetchNews(signal: AbortSignal): Promise<NewsResponse> {
   return getJson('/api/news', signal);
+}
+
+export function fetchPortfolio(signal: AbortSignal): Promise<PortfolioResponse> {
+  return getJson('/api/portfolio', signal);
+}
+
+export async function recordTrade(body: TradeRequest): Promise<TradeResponse> {
+  const response = await request('/api/portfolio/trade', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: new AbortController().signal,
+  });
+  return (await response.json()) as TradeResponse;
 }
 
 type ChatEvent =

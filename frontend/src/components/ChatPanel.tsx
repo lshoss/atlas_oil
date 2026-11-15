@@ -10,20 +10,14 @@ const GREETING =
 interface ChatPanelProps {
   selectedSymbol: string;
   selectedRange: RangeKey;
-  onUiAction: (symbol: string, range?: RangeKey) => void;
+  onUiAction: (event: UiActionEvent) => void;
   onSendReady: (send: (q: string) => void) => void;
 }
 
 export function ChatPanel({ selectedSymbol, selectedRange, onUiAction, onSendReady }: ChatPanelProps) {
-  const handleUiAction = (event: UiActionEvent) => {
-    if (event.action === 'select_chart') {
-      onUiAction(event.symbol, event.range);
-    }
-  };
-
   const { messages, draft, error, streaming, send, retry, clear } = useChat({
     context: { selected_symbol: selectedSymbol, selected_range: selectedRange },
-    onUiAction: handleUiAction,
+    onUiAction,
   });
 
   const [question, setQuestion] = useState('');

@@ -1,5 +1,6 @@
-import { LuMessageSquare, LuNewspaper } from 'react-icons/lu';
+import { LuNewspaper } from 'react-icons/lu';
 import { usePolling } from '../hooks/usePolling';
+import { useNotifications } from '../hooks/useNotifications';
 import { fetchNews } from '../lib/api';
 import { timeAgo } from '../lib/format';
 import type { NewsSourceStatus } from '../lib/types';
@@ -18,13 +19,11 @@ function sourceNote(sources: NewsSourceStatus[]): string | null {
   return null;
 }
 
-interface NewsPanelProps {
-  onAsk: (question: string) => void;
-}
-
-export function NewsPanel({ onAsk }: NewsPanelProps) {
+export function NewsPanel() {
   const { data, error, loading, reload } = usePolling(fetchNews, REFRESH_MS);
   const note = data && sourceNote(data.sources);
+  const items = [...(data?.items ?? [])].sort((a, b) => b.urgency_score - a.urgency_score);
+  const notifications = useNotifications(items);
 
   return (
     <section className="panel news-panel" aria-labelledby="news-title">
@@ -35,6 +34,18 @@ export function NewsPanel({ onAsk }: NewsPanelProps) {
         </div>
         {note && <p className="news-panel__note">{note}</p>}
       </header>
+
+      {notifications.supported && notifications.permission !== 'denied' && (
+        <div className="notifications-banner">
+          <p>Notificações só funcionam enquanto esta aba estiver aberta no browser.</p>
+          {!notifications.enabled && (
+            <button type="button" className="button" onClick={() => void notifications.enable()}>
+              Ativar alertas
+            </button>
+          )}
+          {notifications.enabled && <span>Alertas ativados</span>}
+        </div>
+      )}
 
       {data?.stale && (
         <p className="news-panel__note">As fontes não responderam. Esta é a última lista recebida.</p>
@@ -57,26 +68,23 @@ export function NewsPanel({ onAsk }: NewsPanelProps) {
 
       {data && data.items.length > 0 && (
         <ul className="news-list">
-          {data.items.map((item) => (
-            <li key={item.title} className="news-item">
-              <div className="news-item__row">
-                <a href={item.url} target="_blank" rel="noreferrer">
-                  {item.title}
-                </a>
-                <button
-                  type="button"
-                  className="icon-button news-item__ask"
-                  title="Perguntar ao Agente Barril sobre esta notícia"
-                  aria-label={`Perguntar ao agente sobre: ${item.title}`}
-                  onClick={() => onAsk(`O que você sabe sobre esta notícia? "${item.title}"`)}
-                >
-                  <LuMessageSquare aria-hidden="true" />
-                </button>
-              </div>
+          {items.map((item) => (
+            <li key={item.url} className="news-item">
+              <a href={item.url} target="_blank" rel="noreferrer">
+                {item.title}
+              </a>
               <div className="news-item__meta">
                 <span>
-                  {item.source} · {timeAgo(item.published_at)}
+                  {item.source} · {timeAgo(item.published_at)} ·{' '}
+                  {new Date(item.published_at).toLocaleString('pt-BR', {
+                    dateStyle: 'short',
+                    timeStyle: 'short',
+                  })}
                 </span>
+                {item.urgency_score >= 60 && <span className="tag tag--urgent">URGENTE</span>}
+                {item.urgency_score >= 30 && item.urgency_score < 60 && (
+                  <span className="tag tag--relevant">RELEVANTE</span>
+                )}
                 {item.tags.map((tag) => (
                   <span key={tag} className="tag">
                     {tag}

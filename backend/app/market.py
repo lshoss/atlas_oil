@@ -35,7 +35,7 @@ class Asset:
     unit: str
 
 
-ASSETS = (
+DEFAULT_ASSETS = (
     Asset("BRENT", "Petróleo Brent", "commodity", "BZ=F", "USD", "US$/bbl"),
     Asset("WTI", "Petróleo WTI", "commodity", "CL=F", "USD", "US$/bbl"),
     Asset("NG", "Gás Natural", "commodity", "NG=F", "USD", "US$/MMBtu"),
@@ -43,7 +43,22 @@ ASSETS = (
     Asset("PRIO3", "PRIO ON", "stock", "PRIO3.SA", "BRL", "por ação"),
     Asset("RECV3", "PetroRecôncavo ON", "stock", "RECV3.SA", "BRL", "por ação"),
 )
-ASSETS_BY_SYMBOL = {asset.symbol: asset for asset in ASSETS}
+ASSETS = DEFAULT_ASSETS
+ASSETS_BY_SYMBOL = {asset.symbol: asset for asset in DEFAULT_ASSETS}
+
+
+def assets_from_config(extra_assets: str = "") -> tuple[Asset, ...]:
+    """Monta o catálogo, aceitando tickers Yahoo opcionais separados por vírgula."""
+    known = {asset.symbol for asset in DEFAULT_ASSETS}
+    extras: list[Asset] = []
+    for raw in extra_assets.split(","):
+        symbol = raw.strip().upper()
+        if not symbol or symbol in known:
+            continue
+        # Símbolos extras usam o mesmo código no Yahoo. ETFs e ações ficam no mesmo grupo.
+        extras.append(Asset(symbol, symbol, "stock", symbol, "USD", "por cota"))
+        known.add(symbol)
+    return (*DEFAULT_ASSETS, *extras)
 
 
 @dataclass(frozen=True)
@@ -94,13 +109,15 @@ def change_percent(points: list[PricePoint]) -> float | None:
 
 
 class MarketService:
-    def __init__(self, http: httpx2.AsyncClient) -> None:
+    def __init__(self, http: httpx2.AsyncClient, extra_assets: str = "") -> None:
         self._http = http
+        self.assets = assets_from_config(extra_assets)
+        self.assets_by_symbol = {asset.symbol: asset for asset in self.assets}
         self._cache: TTLCache[Series] = TTLCache(ttl=SERIES_TTL_SECONDS)
         self._slots = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
     async def quotes(self) -> QuotesResponse:
-        results = await asyncio.gather(*(self._quote(asset) for asset in ASSETS))
+        results = await asyncio.gather(*(self._quote(asset) for asset in self.assets))
         quotes = [quote for quote, _ in results]
         updates = [fetched_at for _, fetched_at in results if fetched_at]
         return QuotesResponse(
@@ -110,7 +127,7 @@ class MarketService:
         )
 
     async def history(self, symbol: str, range_key: RangeKey) -> HistoryResponse:
-        asset = ASSETS_BY_SYMBOL[symbol]
+        asset = self.assets_by_symbol[symbol]
         cached = await self._series(asset)
         points = cached.value.points
         cutoff = points[-1].date - timedelta(days=RANGE_DAYS[range_key])

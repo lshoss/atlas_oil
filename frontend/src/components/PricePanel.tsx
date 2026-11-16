@@ -1,12 +1,8 @@
-import { useCallback, useState } from 'react';
-import { usePolling } from '../hooks/usePolling';
-import { fetchHistory } from '../lib/api';
 import { formatFullDay, formatNumber, formatSignedPercent } from '../lib/format';
-import type { PricePoint, RangeKey } from '../lib/types';
+import type { HistoryResponse, PricePoint, RangeKey } from '../lib/types';
 import { AreaChart } from './AreaChart';
 
 const RANGES: RangeKey[] = ['7d', '30d', '90d', '1a'];
-const REFRESH_MS = 5 * 60_000;
 
 function periodChange(points: PricePoint[]): number | null {
   if (points.length < 2 || points[0].close === 0) return null;
@@ -16,15 +12,22 @@ function periodChange(points: PricePoint[]): number | null {
 interface PricePanelProps {
   symbol: string;
   range: RangeKey;
-  onRangeChange: (range: RangeKey) => void;
+  setRange: (range: RangeKey) => void;
+  data: HistoryResponse | null;
+  error: string | null;
+  loading: boolean;
+  reload: () => void;
 }
 
-export function PricePanel({ symbol, range, onRangeChange }: PricePanelProps) {
-  const load = useCallback(
-    (signal: AbortSignal) => fetchHistory(symbol, range, signal),
-    [symbol, range],
-  );
-  const { data, error, loading, reload } = usePolling(load, REFRESH_MS, `${symbol}:${range}`);
+export function PricePanel({
+  symbol,
+  range,
+  setRange,
+  data,
+  error,
+  loading,
+  reload,
+}: PricePanelProps) {
 
   const points = data?.points ?? [];
   const change = periodChange(points);
@@ -58,7 +61,7 @@ export function PricePanel({ symbol, range, onRangeChange }: PricePanelProps) {
               key={option}
               type="button"
               aria-pressed={option === range}
-              onClick={() => onRangeChange(option)}
+              onClick={() => setRange(option)}
             >
               {option}
             </button>

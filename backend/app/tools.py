@@ -1,23 +1,19 @@
-"""Ferramentas disponíveis para o agente: cotações, histórico, notícias, carteira e ações de UI.
+"""Ferramentas disponíveis para o agente: cotações, histórico, notícias e análise.
 
 Cada ferramenta é descrita no formato JSON Schema que o OpenAI tool-calling espera,
 e o ToolExecutor sabe chamar o serviço correspondente e serializar o resultado.
 """
 
+import asyncio
 import json
-from datetime import UTC, datetime
+import math
+import logging
 from typing import Any
 
-from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
-
-from . import db as database
+from .cache import UpstreamError
 from .market import ASSETS_BY_SYMBOL, MarketService
-from .models import PortfolioHolding, PortfolioTransaction, StoredNews
 from .news import NewsService
 from .schemas import RangeKey
-
-VALID_RANGES: list[RangeKey] = ["7d", "30d", "90d", "1a"]
 
 # ---------------------------------------------------------------------------
 # Definições das ferramentas (enviadas ao modelo em cada chamada)
@@ -53,7 +49,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     },
                     "range": {
                         "type": "string",
-                        "enum": VALID_RANGES,
+                        "enum": ["7d", "30d", "90d", "1a"],
                         "description": "Período: 7d, 30d, 90d ou 1a (um ano).",
                     },
                 },
@@ -87,12 +83,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "set_dashboard_view",
+            "name": "get_analysis",
             "description": (
-                "Muda o ativo e/ou o período exibidos no gráfico principal do painel do usuário. "
-                "Chame esta ferramenta sempre que o usuário pedir explicitamente para ver um ativo "
-                "ou período específico, ou quando sua resposta comparar um ativo diferente do que "
-                "está atualmente selecionado na tela — assim o gráfico acompanha a explicação."
+                "Compila dados factuais sobre um ativo para subsidiar uma análise de prós e contras. "
+                "Retorna: cotação atual, variação diária, tendência no período, máxima, mínima, "
+                "volatilidade (desvio-padrão dos retornos diários) e notícias recentes relacionadas "
+                "com título, fonte e URL. Use quando o usuário pedir análise, perspectivas ou "
+                "prós e contras de um ativo. Nunca classifique os fatores como positivos ou "
+                "negativos — deixe os dados falar e deixe o usuário decidir."
             ),
             "parameters": {
                 "type": "object",
@@ -100,163 +98,92 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "symbol": {
                         "type": "string",
                         "enum": list(ASSETS_BY_SYMBOL.keys()),
-                        "description": "Símbolo do ativo a exibir: BRENT, WTI, NG, PETR4, PRIO3 ou RECV3.",
+                        "description": "Símbolo do ativo a analisar.",
                     },
                     "range": {
                         "type": "string",
-                        "enum": VALID_RANGES,
-                        "description": "Período do gráfico: 7d, 30d, 90d ou 1a. Omita para manter o atual.",
+                        "enum": ["7d", "30d", "90d", "1a"],
+                        "description": "Período histórico para cálculo da tendência e volatilidade.",
                     },
                 },
-                "required": ["symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_user_portfolio",
-            "description": (
-                "Retorna a carteira atual do usuário com preço médio, cotação atual e "
-                "retorno percentual e financeiro de cada posição. "
-                "Use quando o usuário perguntar sobre seus investimentos, posições ou resultado."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "record_trade",
-            "description": (
-                "Registra uma compra (BUY) ou venda (SELL) na carteira do usuário. "
-                "Use quando o usuário informar que realizou uma operação, "
-                "por exemplo: 'comprei 100 PETR4 a 37,50' ou 'vendi 50 PRIO3 a 42,00'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "enum": list(ASSETS_BY_SYMBOL.keys()),
-                        "description": "Símbolo do ativo negociado.",
-                    },
-                    "side": {
-                        "type": "string",
-                        "enum": ["BUY", "SELL"],
-                        "description": "BUY para compra, SELL para venda.",
-                    },
-                    "quantity": {
-                        "type": "number",
-                        "exclusiveMinimum": 0,
-                        "description": "Quantidade negociada.",
-                    },
-                    "price": {
-                        "type": "number",
-                        "exclusiveMinimum": 0,
-                        "description": "Preço unitário da operação.",
-                    },
-                },
-                "required": ["symbol", "side", "quantity", "price"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_news_archive",
-            "description": (
-                "Busca notícias históricas do setor no arquivo do banco de dados. "
-                "Use para responder perguntas sobre eventos passados além dos últimos 3 dias."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {
-                        "type": "string",
-                        "description": "Palavra-chave para buscar no título da notícia.",
-                    },
-                    "symbol": {
-                        "type": "string",
-                        "enum": list(ASSETS_BY_SYMBOL.keys()),
-                        "description": "Filtra notícias que mencionam um ativo específico.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 10,
-                        "description": "Máximo de resultados (padrão 5).",
-                    },
-                },
-                "required": [],
+                "required": ["symbol", "range"],
             },
         },
     },
 ]
 
 
+def tool_definitions(symbols: list[str] | None = None) -> list[dict[str, Any]]:
+    """Retorna as definições com o enum de ativos do serviço em execução."""
+    if symbols is None:
+        return TOOL_DEFINITIONS
+    definitions = json.loads(json.dumps(TOOL_DEFINITIONS))
+    for definition in definitions:
+        parameters = definition["function"]["parameters"]
+        symbol = parameters.get("properties", {}).get("symbol")
+        if symbol is not None:
+            symbol["enum"] = symbols
+    return definitions
+
+
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+VALID_RANGES = {"7d", "30d", "90d", "1a"}
+
+
+def _as_json(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _source_unavailable(name: str, cause: Exception) -> dict[str, str]:
+    # Não devolvemos o texto bruto da exceção: pode incluir detalhes internos da API.
+    logger.warning("Fonte %s indisponível durante tool calling (%s)", name, type(cause).__name__)
+    return {"fonte": name, "estado": "indisponível", "motivo": "Falha temporária ao consultar a fonte."}
 
 
 class ToolExecutor:
     def __init__(self, market: MarketService, news: NewsService) -> None:
         self._market = market
         self._news = news
-        self.pending_ui_actions: list[dict[str, Any]] = []
+
+    @property
+    def definitions(self) -> list[dict[str, Any]]:
+        return tool_definitions(list(self._market.assets_by_symbol))
 
     async def run(self, name: str, arguments: str) -> str:
-        """Executa a ferramenta `name` com os `arguments` (JSON string) e devolve o resultado."""
+        """Executa uma ferramenta e devolve sempre JSON para o modelo.
+
+        Falhas conhecidas de fontes externas não interrompem o SSE do chat.
+        Erros de programação inesperados continuam visíveis nos logs do servidor.
+        """
         try:
-            args: dict[str, Any] = json.loads(arguments) if arguments else {}
-        except json.JSONDecodeError:
-            return json.dumps({"error": "argumentos inválidos"})
+            args = json.loads(arguments) if arguments else {}
+        except (json.JSONDecodeError, TypeError):
+            return _as_json({"error": "argumentos inválidos"})
+        if not isinstance(args, dict):
+            return _as_json({"error": "argumentos devem ser um objeto JSON"})
 
-        if name == "get_quotes":
-            return await self._get_quotes()
-        if name == "get_history":
-            return await self._get_history(args)
-        if name == "get_news":
-            return await self._get_news(args)
-        if name == "set_dashboard_view":
-            return self._set_dashboard_view(args)
-        if name == "get_user_portfolio":
-            return await self._get_user_portfolio()
-        if name == "record_trade":
-            return await self._record_trade(args)
-        if name == "search_news_archive":
-            return await self._search_news_archive(args)
-        return json.dumps({"error": f"ferramenta desconhecida: {name}"})
-
-    # ------------------------------------------------------------------
-    # UI action
-    # ------------------------------------------------------------------
-
-    def _set_dashboard_view(self, args: dict[str, Any]) -> str:
-        symbol: str = args.get("symbol", "")
-        range_arg: str | None = args.get("range")
-
-        if symbol not in ASSETS_BY_SYMBOL:
-            return json.dumps({"error": f"símbolo inválido: {symbol}"})
-        if range_arg is not None and range_arg not in VALID_RANGES:
-            return json.dumps({"error": f"período inválido: {range_arg}"})
-
-        action: dict[str, Any] = {"action": "select_chart", "symbol": symbol}
-        if range_arg is not None:
-            action["range"] = range_arg
-        self.pending_ui_actions.append(action)
-
-        asset = ASSETS_BY_SYMBOL[symbol]
-        period_note = f" para o período {range_arg}" if range_arg else ""
-        return json.dumps(
-            {"ok": True, "message": f"Gráfico atualizado para {asset.name}{period_note}."},
-            ensure_ascii=False,
-        )
-
-    # ------------------------------------------------------------------
-    # Market data
-    # ------------------------------------------------------------------
+        try:
+            if name == "get_quotes":
+                return await self._get_quotes()
+            if name == "get_history":
+                return await self._get_history(args)
+            if name == "get_news":
+                return await self._get_news(args)
+            if name == "get_analysis":
+                return await self._get_analysis(args)
+            return _as_json({"error": f"ferramenta desconhecida: {name}"})
+        except UpstreamError as error:
+            # Para consultas não agregadas: o agente recebe a falha como dado, não como crash.
+            return _as_json({
+                "status": "indisponível",
+                "error": "A fonte externa está temporariamente indisponível.",
+                "orientação": "Não informe preços ou dados financeiros não confirmados.",
+                "detalhes": [_source_unavailable("serviço externo", error)],
+            })
 
     async def _get_quotes(self) -> str:
         response = await self._market.quotes()
@@ -264,153 +191,180 @@ class ToolExecutor:
         for q in response.quotes:
             change = f"{q.change_percent:+.2f}%" if q.change_percent is not None else "—"
             price = f"{q.price:.2f} {q.currency}/{q.unit}" if q.price is not None else "indisponível"
-            rows.append({"ativo": q.name, "símbolo": q.symbol, "preço": price, "variação_dia": change})
-        return json.dumps({"cotações": rows, "fonte": response.source}, ensure_ascii=False)
+            rows.append({
+                "ativo": q.name, "símbolo": q.symbol, "preço": price,
+                "variação_dia": change,
+                "desatualizado": bool(getattr(q, "stale", False)),
+                "data_referência": q.as_of.isoformat() if getattr(q, "as_of", None) else None,
+            })
+        return _as_json({"cotações": rows, "fonte": response.source})
 
     async def _get_history(self, args: dict[str, Any]) -> str:
-        symbol: str = args.get("symbol", "")
-        range_key: RangeKey = args.get("range", "30d")  # type: ignore[assignment]
-        if symbol not in ASSETS_BY_SYMBOL:
-            return json.dumps({"error": f"símbolo inválido: {symbol}"})
+        symbol = args.get("symbol", "")
+        range_key = args.get("range", "30d")
+        if not isinstance(symbol, str) or symbol not in self._market.assets_by_symbol:
+            return _as_json({"error": f"símbolo inválido: {symbol}"})
+        if range_key not in VALID_RANGES:
+            return _as_json({"error": "período inválido"})
         response = await self._market.history(symbol, range_key)
         points = [{"data": p.date.isoformat(), "fechamento": p.close} for p in response.points]
-        return json.dumps(
-            {"símbolo": symbol, "nome": response.name, "unidade": response.unit, "período": range_key, "pontos": points},
-            ensure_ascii=False,
-        )
+        return _as_json({
+            "símbolo": symbol, "nome": response.name, "unidade": response.unit,
+            "período": range_key, "pontos": points,
+            "fonte": response.source,
+            "desatualizado": bool(getattr(response, "stale", False)),
+            "atualizado_em": response.updated_at.isoformat() if response.updated_at else None,
+        })
 
     async def _get_news(self, args: dict[str, Any]) -> str:
-        limit = min(int(args.get("limit", 5)), 10)
+        try:
+            limit = max(1, min(int(args.get("limit", 5)), 10))
+        except (ValueError, TypeError):
+            return _as_json({"error": "limite inválido"})
         response = await self._news.latest(limit)
         items = [
-            {"título": item.title, "fonte": item.source, "url": item.url, "publicado": item.published_at.isoformat(), "ativos": item.tags}
+            {"título": item.title, "fonte": item.source, "url": item.url,
+             "publicado": item.published_at.isoformat(), "ativos": item.tags}
             for item in response.items
         ]
-        return json.dumps({"notícias": items}, ensure_ascii=False)
+        return _as_json({
+            "notícias": items,
+            "desatualizado": bool(getattr(response, "stale", False)),
+            "atualizado_em": response.updated_at.isoformat() if response.updated_at else None,
+        })
 
-    # ------------------------------------------------------------------
-    # Portfolio
-    # ------------------------------------------------------------------
+    async def _get_analysis(self, args: dict[str, Any]) -> str:
+        symbol = args.get("symbol", "")
+        range_key = args.get("range", "30d")
+        if not isinstance(symbol, str) or symbol not in self._market.assets_by_symbol:
+            return _as_json({"error": f"símbolo inválido: {symbol}"})
+        if range_key not in VALID_RANGES:
+            return _as_json({"error": "período inválido"})
 
-    async def _get_user_portfolio(self) -> str:
-        async with database.get_session() as session:
-            result = await session.execute(
-                select(PortfolioHolding).where(PortfolioHolding.quantity > 0)
-            )
-            holdings = list(result.scalars().all())
-
-        if not holdings:
-            return json.dumps({"carteira": [], "mensagem": "Nenhuma posição registrada."}, ensure_ascii=False)
-
-        quotes_resp = await self._market.quotes()
-        price_map = {q.symbol: q for q in quotes_resp.quotes}
-
-        rows = []
-        for h in holdings:
-            quote = price_map.get(h.symbol)
-            current_price = quote.price if quote else None
-            total_cost = round(h.quantity * h.avg_price, 2)
-            current_value = round(h.quantity * current_price, 2) if current_price is not None else None
-            pnl_value = round(current_value - total_cost, 2) if current_value is not None else None
-            pnl_pct = (
-                round((current_value / total_cost - 1) * 100, 2)
-                if current_value is not None and total_cost != 0
-                else None
-            )
-            rows.append({
-                "símbolo": h.symbol,
-                "quantidade": h.quantity,
-                "preço_médio": h.avg_price,
-                "cotação_atual": current_price,
-                "custo_total": total_cost,
-                "valor_atual": current_value,
-                "retorno_%": pnl_pct,
-                "retorno_$": pnl_value,
-            })
-        return json.dumps({"carteira": rows}, ensure_ascii=False)
-
-    async def _record_trade(self, args: dict[str, Any]) -> str:
-        symbol: str = args.get("symbol", "")
-        side: str = args.get("side", "")
-        quantity = float(args.get("quantity", 0))
-        price = float(args.get("price", 0))
-
-        if symbol not in ASSETS_BY_SYMBOL:
-            return json.dumps({"error": f"símbolo inválido: {symbol}"})
-        if side not in ("BUY", "SELL"):
-            return json.dumps({"error": "side deve ser BUY ou SELL"})
-        if quantity <= 0 or price <= 0:
-            return json.dumps({"error": "quantidade e preço devem ser positivos"})
-
-        async with database.get_session() as session:
-            result = await session.execute(
-                select(PortfolioHolding).where(PortfolioHolding.symbol == symbol)
-            )
-            holding = result.scalar_one_or_none()
-
-            if side == "BUY":
-                if holding is None:
-                    holding = PortfolioHolding(
-                        symbol=symbol, quantity=quantity, avg_price=price, updated_at=datetime.now(UTC)
-                    )
-                    session.add(holding)
-                else:
-                    total_qty = holding.quantity + quantity
-                    holding.avg_price = round(
-                        (holding.quantity * holding.avg_price + quantity * price) / total_qty, 6
-                    )
-                    holding.quantity = round(total_qty, 8)
-                    holding.updated_at = datetime.now(UTC)
-            else:
-                if holding is None or holding.quantity < quantity:
-                    available = holding.quantity if holding else 0
-                    return json.dumps({"error": f"Quantidade insuficiente (disponível: {available})"})
-                holding.quantity = round(holding.quantity - quantity, 8)
-                holding.updated_at = datetime.now(UTC)
-
-            session.add(PortfolioTransaction(
-                symbol=symbol, side=side, quantity=quantity, price=price, executed_at=datetime.now(UTC)
-            ))
-            await session.flush()
-
-        # Notifica o frontend para recarregar o card de carteira
-        self.pending_ui_actions.append({"action": "refresh_portfolio"})
-
-        asset = ASSETS_BY_SYMBOL[symbol]
-        verb = "Compra" if side == "BUY" else "Venda"
-        return json.dumps(
-            {
-                "ok": True,
-                "message": f"{verb} de {quantity} {asset.name} a {price} registrada. "
-                           f"Nova posição: {holding.quantity} unidades, PM {holding.avg_price:.4f}.",
-            },
-            ensure_ascii=False,
+        # Cada consulta pode falhar independentemente. A falha de um serviço não
+        # elimina o resultado das demais consultas.
+        results = await asyncio.gather(
+            self._market.quotes(),
+            self._market.history(symbol, range_key),
+            self._news.latest(10),
+            return_exceptions=True,
         )
+        issues: list[dict[str, str]] = []
+        resolved = []
+        for name, result in zip(("cotações", "histórico", "notícias"), results, strict=True):
+            if isinstance(result, BaseException):
+                if not isinstance(result, Exception):
+                    # Não engolir cancelamentos da aplicação.
+                    raise result
+                issues.append(_source_unavailable(name, result))
+                resolved.append(None)
+            else:
+                resolved.append(result)
+        quotes_resp, history_resp, news_resp = resolved
+        asset = self._market.assets_by_symbol[symbol]
 
-    async def _search_news_archive(self, args: dict[str, Any]) -> str:
-        keyword: str = args.get("keyword", "")
-        symbol: str = args.get("symbol", "")
-        limit = min(int(args.get("limit", 5)), 10)
+        quote = (
+            next((q for q in quotes_resp.quotes if q.symbol == symbol), None)
+            if quotes_resp is not None else None
+        )
+        quote_available = quote is not None and quote.price is not None
+        if quote_available:
+            cotacao = f"{quote.price:.2f} {quote.currency}/{asset.unit}"
+            variacao = (
+                f"{quote.change_percent:+.2f}%"
+                if quote.change_percent is not None else "indisponível"
+            )
+        else:
+            cotacao = variacao = "indisponível"
+            if quotes_resp is not None:
+                issues.append({
+                    "fonte": "cotações", "estado": "sem preço",
+                    "motivo": "A fonte respondeu, mas não forneceu preço para este ativo.",
+                })
 
-        async with database.get_session() as session:
-            stmt = select(StoredNews).order_by(StoredNews.published_at.desc())
-            if keyword:
-                stmt = stmt.where(StoredNews.title.ilike(f"%{keyword}%"))
-            if symbol:
-                stmt = stmt.where(StoredNews.tags.contains(symbol))
-            rows = (await session.execute(stmt.limit(limit))).scalars().all()
+        points = history_resp.points if history_resp is not None else []
+        if len(points) >= 2:
+            first_close, last_close = points[0].close, points[-1].close
+            if first_close > 0:
+                change = (last_close / first_close - 1) * 100
+                direction = "alta" if change >= 0 else "queda"
+                tendencia = f"{direction} de {abs(change):.1f}% em {range_key}"
+            else:
+                tendencia = "indisponível"
+            maxima = max(p.close for p in points)
+            minima = min(p.close for p in points)
+            returns = [
+                (points[i].close - points[i-1].close) / points[i-1].close * 100
+                for i in range(1, len(points)) if points[i-1].close > 0
+            ]
+            if len(returns) >= 2:
+                mean = sum(returns) / len(returns)
+                variance = sum((r-mean)**2 for r in returns) / len(returns)
+                volatilidade = f"{math.sqrt(variance):.2f}%"
+            else:
+                volatilidade = "insuficiente"
+        else:
+            tendencia = "indisponível" if history_resp is None else "histórico insuficiente"
+            maxima = minima = None
+            volatilidade = "insuficiente"
 
-        if not rows:
-            return json.dumps({"notícias": [], "mensagem": "Nenhuma notícia encontrada no arquivo."}, ensure_ascii=False)
-
-        items = [
+        items = news_resp.items if news_resp is not None else []
+        # Notícias sem tags são contexto setorial; não apresentá-las como fato
+        # específico da empresa apenas porque mencionam petróleo.
+        noticias_do_ativo = [
             {
-                "título": row.title,
-                "fonte": row.source,
-                "url": row.url,
-                "publicado": row.published_at.isoformat(),
-                "ativos": row.tags_list(),
+                "título": item.title, "fonte": item.source, "url": item.url,
+                "publicado": item.published_at.isoformat(),
+                "ativos_relacionados": item.tags,
             }
-            for row in rows
+            for item in items if symbol in item.tags
         ]
-        return json.dumps({"notícias": items}, ensure_ascii=False)
+        contexto_setorial = [
+            {
+                "título": item.title, "fonte": item.source, "url": item.url,
+                "publicado": item.published_at.isoformat(),
+                "observação": "Notícia geral do setor; impacto neste ativo não confirmado.",
+            }
+            for item in items if not item.tags
+        ][:5]
+
+        stale = {
+            "cotação": bool(getattr(quote, "stale", False)) if quote else False,
+            "histórico": bool(getattr(history_resp, "stale", False)),
+            "notícias": bool(getattr(news_resp, "stale", False)),
+        }
+        updated = {
+            "cotação": quote.as_of.isoformat() if quote and quote.as_of else None,
+            "histórico": history_resp.updated_at.isoformat() if history_resp else None,
+            "notícias": news_resp.updated_at.isoformat() if news_resp else None,
+        }
+        if any(stale.values()):
+            issues.append({
+                "fonte": "cache", "estado": "desatualizado",
+                "motivo": "Um ou mais resultados foram recuperados do cache antigo; ver datas de referência.",
+            })
+
+        # Não inventar números: se uma fonte falhou, a saída tem campos de dados
+        # explícitos como indisponíveis, mas o Groq ainda recebe as notícias válidas.
+        return _as_json({
+            "ativo": asset.name,
+            "símbolo": symbol,
+            "cotação_atual": cotacao,
+            "variação_dia": variacao,
+            "tendência_período": tendencia,
+            "máxima_período": maxima,
+            "mínima_período": minima,
+            "volatilidade_diária_dp": volatilidade,
+            "notícias_relevantes": noticias_do_ativo,
+            "notícias_contexto_setor": contexto_setorial,
+            "dados_parciais": bool(issues),
+            "fontes_indisponíveis_ou_limitadas": issues,
+            "dados_desatualizados": stale,
+            "data_referência": updated,
+            "aviso": (
+                "Dados de fontes externas podem estar ausentes ou desatualizados. "
+                "Quando um campo estiver indisponível, não inferir números, tendência ou volatilidade. "
+                "Notícias de contexto setorial não provam impacto específico neste ativo. "
+                "Fatos e interpretações devem ser separados. Não constitui recomendação de investimento."
+            ),
+        })

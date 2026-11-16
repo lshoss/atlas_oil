@@ -7,10 +7,10 @@ RUN poetry install --only main --no-interaction --no-ansi
 
 FROM python:3.13-slim
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-RUN useradd --system --no-create-home barril
+RUN useradd --system --no-create-home atlasoil
 WORKDIR /app
 COPY --from=build /app/.venv ./.venv
 COPY app ./app
-USER barril
+USER atlasoil
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -5,7 +5,19 @@ import httpx2
 import pytest
 
 from app.cache import UpstreamError
-from app.news import NewsService, asset_tags, is_sector_news
+from app.news import NewsService, asset_tags, is_sector_news, score_item
+
+
+def test_news_score_categories():
+    now = datetime(2026, 11, 15, 12, tzinfo=UTC)
+    old = now - timedelta(hours=4)
+
+    assert score_item("Guerra afeta oferta", [], "site.com", old, now=now) == 60
+    assert score_item("OPEC cut anunciado", [], "site.com", old, now=now) == 50
+    assert score_item(
+        "Resultado trimestral", [], "reuters.com", now - timedelta(hours=1), now=now
+    ) == 40
+    assert score_item("Petróleo sobe levemente", [], "site.com", old, now=now) == 0
 
 
 def gdelt_article(title, minutes_ago=10, domain="www.infomoney.com.br", url=None):
@@ -114,10 +126,11 @@ def test_merges_sources_and_removes_repeated_titles():
     response = asyncio.run(service_with(handler).latest(20))
 
     assert [item.title for item in response.items] == [
-        "Brent sobe 2%",
+        "Brent sobe 2%!",
         "Oil majors raise output",
         "Brazil's state firm hires new CEO",
     ]
+    assert response.items[0].source == "infomoney.com.br"
     assert all(source.status == "ok" for source in response.sources)
 
 

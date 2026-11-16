@@ -31,7 +31,7 @@ export function Header({ quotes }: { quotes: Polled<QuotesResponse> }) {
     <header className="topbar">
       <div className="topbar__brand">
         <RiDropFill aria-hidden="true" />
-        <span>Barril</span>
+        <span>AtlasOil</span>
       </div>
       <p className={`topbar__status topbar__status--${tone}`} role="status">
         <span>

@@ -2,13 +2,9 @@ import type {
   ApiMessage,
   HistoryResponse,
   NewsResponse,
-  PortfolioResponse,
   QuotesResponse,
   RangeKey,
-  TradeRequest,
-  TradeResponse,
-  UIContext,
-  UiActionEvent,
+  SseToolCallEvent,
 } from './types';
 
 const BACKEND_DOWN = 'O backend não respondeu. Confira se ele está rodando na porta 8000.';
@@ -58,26 +54,11 @@ export function fetchNews(signal: AbortSignal): Promise<NewsResponse> {
   return getJson('/api/news', signal);
 }
 
-export function fetchPortfolio(signal: AbortSignal): Promise<PortfolioResponse> {
-  return getJson('/api/portfolio', signal);
-}
-
-export async function recordTrade(body: TradeRequest): Promise<TradeResponse> {
-  const response = await request('/api/portfolio/trade', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: new AbortController().signal,
-  });
-  return (await response.json()) as TradeResponse;
-}
-
 type ChatEvent =
   | { type: 'delta'; text: string }
   | { type: 'done'; truncated: boolean }
   | { type: 'error'; message: string }
-  | { type: 'tool_call'; tools: string[] }
-  | UiActionEvent;
+  | SseToolCallEvent;
 
 export interface ChatOutcome {
   truncated: boolean;
@@ -85,15 +66,14 @@ export interface ChatOutcome {
 
 export async function streamChat(
   messages: ApiMessage[],
-  context: UIContext | undefined,
   onDelta: (text: string) => void,
-  onUiAction: (event: UiActionEvent) => void,
   signal: AbortSignal,
+  onToolCall?: (event: SseToolCallEvent) => void,
 ): Promise<ChatOutcome> {
   const response = await request('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages, context }),
+    body: JSON.stringify({ messages }),
     signal,
   });
   if (!response.body) throw new Error('O navegador não recebeu a resposta do chat.');
@@ -115,10 +95,9 @@ export async function streamChat(
       if (!frame.startsWith('data: ')) continue;
       const event = JSON.parse(frame.slice('data: '.length)) as ChatEvent;
       if (event.type === 'delta') onDelta(event.text);
+      if (event.type === 'tool_call') onToolCall?.(event);
       if (event.type === 'done') return { truncated: event.truncated };
       if (event.type === 'error') throw new Error(event.message);
-      if (event.type === 'ui_action') onUiAction(event);
-      // tool_call events are intentionally ignored in the UI (no visual for now)
     }
   }
 }

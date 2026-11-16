@@ -42,6 +42,18 @@ export interface NewsItem {
   source: string;
   published_at: string;
   tags: string[];
+  urgency_score: number;
+}
+
+export interface ToolCallInfo {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+export interface SseToolCallEvent {
+  type: 'tool_call';
+  tools: string[];
+  tool_calls: ToolCallInfo[];
 }
 
 export interface NewsSourceStatus {
@@ -59,48 +71,4 @@ export interface NewsResponse {
 export interface ApiMessage {
   role: 'user' | 'assistant';
   content: string;
-}
-
-export interface UIContext {
-  selected_symbol?: string;
-  selected_range?: RangeKey;
-  active_news_url?: string;
-}
-
-export type UiActionEvent =
-  | { type: 'ui_action'; action: 'select_chart'; symbol: string; range?: RangeKey }
-  | { type: 'ui_action'; action: 'refresh_portfolio' };
-
-export interface PortfolioPosition {
-  symbol: string;
-  name: string;
-  quantity: number;
-  avg_price: number;
-  current_price: number | null;
-  currency: string;
-  total_cost: number;
-  current_value: number | null;
-  pnl_value: number | null;
-  pnl_pct: number | null;
-  updated_at: string;
-}
-
-export interface PortfolioResponse {
-  positions: PortfolioPosition[];
-}
-
-export interface TradeRequest {
-  symbol: string;
-  side: 'BUY' | 'SELL';
-  quantity: number;
-  price: number;
-}
-
-export interface TradeResponse {
-  symbol: string;
-  side: string;
-  quantity: number;
-  price: number;
-  new_quantity: number;
-  new_avg_price: number;
 }

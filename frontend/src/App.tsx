@@ -1,39 +1,45 @@
-import { useCallback, useRef, useState } from 'react';
 import { LuBuilding2, LuDroplet } from 'react-icons/lu';
 import { ChatPanel } from './components/ChatPanel';
 import { Header } from './components/Header';
 import { NewsPanel } from './components/NewsPanel';
-import { PortfolioPanel } from './components/PortfolioPanel';
 import { PricePanel } from './components/PricePanel';
 import { QuoteGroup } from './components/QuoteGroup';
+import { ReturnHistogram } from './components/ReturnHistogram';
 import { usePolling } from './hooks/usePolling';
-import { fetchQuotes } from './lib/api';
-import type { RangeKey, UiActionEvent } from './lib/types';
+import { fetchHistory, fetchQuotes } from './lib/api';
+import type { RangeKey } from './lib/types';
 
-const DEFAULT_SYMBOL = 'BRENT';
-const DEFAULT_RANGE: RangeKey = '30d';
 const QUOTES_REFRESH_MS = 60_000;
+const HISTORY_REFRESH_MS = 5 * 60_000;
 
 export function App() {
-  const [selectedSymbol, setSelectedSymbol] = useState<string>(DEFAULT_SYMBOL);
-  const [selectedRange, setSelectedRange] = useState<RangeKey>(DEFAULT_RANGE);
-  // Incrementing this key forces PortfolioPanel to re-fetch
-  const [portfolioKey, setPortfolioKey] = useState(0);
-  // Ref populated by ChatPanel so NewsPanel can trigger a question without prop drilling
-  const sendQuestionRef = useRef<((q: string) => void) | null>(null);
-
   const quotes = usePolling(fetchQuotes, QUOTES_REFRESH_MS);
   const allQuotes = quotes.data?.quotes ?? [];
+  const [chartSymbol, setChartSymbol] = useState('BRENT');
+  const [range, setRange] = useState<RangeKey>('30d');
+  const loadHistory = useCallback(
+    (signal: AbortSignal) => fetchHistory(chartSymbol, range, signal),
+    [chartSymbol, range],
+  );
+  const history = usePolling(
+    loadHistory,
+    HISTORY_REFRESH_MS,
+    `${chartSymbol}:${range}`,
+  );
 
-  const handleUiAction = useCallback((event: UiActionEvent) => {
-    if (event.action === 'select_chart') {
-      setSelectedSymbol(event.symbol);
-      if (event.range) setSelectedRange(event.range);
-    }
-    if (event.action === 'refresh_portfolio') {
-      setPortfolioKey((k) => k + 1);
-    }
-  }, []);
+  useEffect(() => {
+    const selectFromChat = (event: Event) => {
+      const symbol = (event as CustomEvent<unknown>).detail;
+      if (
+        typeof symbol === 'string' &&
+        (allQuotes.length === 0 || allQuotes.some((quote) => quote.symbol === symbol))
+      ) {
+        setChartSymbol(symbol);
+      }
+    };
+    window.addEventListener('atlasoil:symbol-selected', selectFromChat);
+    return () => window.removeEventListener('atlasoil:symbol-selected', selectFromChat);
+  }, [allQuotes]);
 
   return (
     <div className="app">
@@ -47,34 +53,38 @@ export function App() {
               tone="amber"
               icon={<LuDroplet aria-hidden="true" />}
               quotes={allQuotes.filter((quote) => quote.kind === 'commodity')}
-              selectedSymbol={selectedSymbol}
-              onSelect={setSelectedSymbol}
+              selectedSymbol={chartSymbol}
+              onSelectSymbol={setChartSymbol}
             />
             <QuoteGroup
-              title="Ações"
-              description="Empresas do setor na B3, em reais"
+              title="Ações e ETFs"
+              description="Empresas e fundos ligados ao setor"
               tone="teal"
               icon={<LuBuilding2 aria-hidden="true" />}
               quotes={allQuotes.filter((quote) => quote.kind === 'stock')}
-              selectedSymbol={selectedSymbol}
-              onSelect={setSelectedSymbol}
+              selectedSymbol={chartSymbol}
+              onSelectSymbol={setChartSymbol}
             />
           </div>
-          <PortfolioPanel refreshKey={portfolioKey} />
           <PricePanel
-            symbol={selectedSymbol}
-            range={selectedRange}
-            onRangeChange={setSelectedRange}
+            symbol={chartSymbol}
+            range={range}
+            setRange={setRange}
+            data={history.data}
+            error={history.error}
+            loading={history.loading}
+            reload={history.reload}
           />
-          <NewsPanel onAsk={(q) => sendQuestionRef.current?.(q)} />
+          <ReturnHistogram
+            points={history.data?.points ?? []}
+            symbol={chartSymbol}
+            range={range}
+          />
+          <NewsPanel />
         </main>
-        <ChatPanel
-          selectedSymbol={selectedSymbol}
-          selectedRange={selectedRange}
-          onUiAction={handleUiAction}
-          onSendReady={(fn) => { sendQuestionRef.current = fn; }}
-        />
+        <ChatPanel />
       </div>
     </div>
   );
 }
+import { useCallback, useEffect, useState } from 'react';

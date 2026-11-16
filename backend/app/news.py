@@ -2,8 +2,6 @@
 
 import asyncio
 import html
-import json
-import logging
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -11,14 +9,9 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx2
-from sqlalchemy import insert
 
-from . import db as database
 from .cache import TTLCache, UpstreamError
-from .models import StoredNews
 from .schemas import NewsItem, NewsResponse, NewsSourceStatus
-
-logger = logging.getLogger(__name__)
 
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 # O GDELT indexa traduções em inglês, mesmo para veículos em português.
@@ -29,6 +22,17 @@ FINNHUB_COMPANY = "PBR"  # ADR da Petrobras em Nova York
 NEWS_TTL_SECONDS = 15 * 60
 LOOKBACK_DAYS = 3
 MAX_ITEMS = 50
+
+TRUSTED_SOURCES = {
+    "reuters.com", "reuters.co.uk", "bloomberg.com", "valor.com.br",
+    "ft.com", "wsj.com", "infomoney.com.br",
+}
+SCORE_PATTERNS = (
+    (60, ("guerra", "war", "ataque", "attack", "explosao", "explosion", "embargo", "sanctions", "sancoes", "conflict")),
+    (50, ("opec cut", "corte opep", "corte de producao", "production cut", "opec+", "acordo de producao")),
+    (40, ("crise", "crash", "colapso", "collapse", "recessao", "recession", "emergencia", "emergency", "alerta")),
+    (20, ("resultado", "lucro", "prejuizo", "dividend", "dividendo", "guidance", "revisao de meta")),
+)
 
 
 def _normalize(text: str) -> str:
@@ -81,15 +85,39 @@ def _title_key(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", _normalize(title)).strip()
 
 
+def score_item(
+    title: str,
+    tags: list[str],
+    source: str,
+    published_at: datetime,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Calcula relevância/impacto/urgência apenas com metadados observáveis."""
+    text = _normalize(title)
+    score = sum(weight for weight, terms in SCORE_PATTERNS if any(term in text for term in terms))
+    score += min(len(tags) * 10, 20)
+    normalized_source = source.lower().removeprefix("www.")
+    if any(normalized_source == domain or normalized_source.endswith(f".{domain}") for domain in TRUSTED_SOURCES):
+        score += 10
+    reference = now or datetime.now(UTC)
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=UTC)
+    age = reference - published_at.astimezone(UTC)
+    if timedelta(0) <= age <= timedelta(hours=2):
+        score += 10
+    return min(score, 100)
+
+
 def merge_items(*groups: list[NewsItem]) -> list[NewsItem]:
-    """Junta as listas, remove títulos repetidos e ordena da mais recente à mais antiga."""
-    newest_first = sorted(
+    """Junta, deduplica e prioriza urgência/credibilidade antes da recência."""
+    prioritized = sorted(
         (item for group in groups for item in group),
-        key=lambda item: item.published_at,
+        key=lambda item: (item.urgency_score, item.published_at),
         reverse=True,
     )
     unique: dict[str, NewsItem] = {}
-    for item in newest_first:
+    for item in prioritized:
         unique.setdefault(_title_key(item.title), item)
     return list(unique.values())[:MAX_ITEMS]
 
@@ -100,15 +128,17 @@ def parse_gdelt(payload: dict[str, Any]) -> list[NewsItem]:
         title = _clean_title(article["title"])
         if not is_sector_news(title):
             continue
+        published_at = datetime.strptime(article["seendate"], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+        tags = asset_tags(title)
+        source = article["domain"].removeprefix("www.")
         items.append(
             NewsItem(
                 title=title,
                 url=article["url"],
-                source=article["domain"].removeprefix("www."),
-                published_at=datetime.strptime(article["seendate"], "%Y%m%dT%H%M%SZ").replace(
-                    tzinfo=UTC
-                ),
-                tags=asset_tags(title),
+                source=source,
+                published_at=published_at,
+                tags=tags,
+                urgency_score=score_item(title, tags, source, published_at),
             )
         )
     return items
@@ -122,13 +152,17 @@ def parse_finnhub(
         title = _clean_title(article["headline"])
         if not title or not (always_relevant or is_sector_news(title)):
             continue
+        published_at = datetime.fromtimestamp(article["datetime"], UTC)
+        tags = asset_tags(title)
+        source = article["source"]
         items.append(
             NewsItem(
                 title=title,
                 url=article["url"],
-                source=article["source"],
-                published_at=datetime.fromtimestamp(article["datetime"], UTC),
-                tags=asset_tags(title),
+                source=source,
+                published_at=published_at,
+                tags=tags,
+                urgency_score=score_item(title, tags, source, published_at),
             )
         )
     return items
@@ -175,31 +209,7 @@ class NewsService:
 
         if not groups:
             raise UpstreamError("Nenhuma fonte de notícias respondeu.")
-
-        batch = NewsBatch(merge_items(*groups), sources)
-        asyncio.create_task(self._persist(batch.items))
-        return batch
-
-    async def _persist(self, items: list[NewsItem]) -> None:
-        """Upsert das notícias no banco em background (ON CONFLICT DO NOTHING)."""
-        if not items:
-            return
-        rows = [
-            {
-                "url": item.url,
-                "title": item.title,
-                "source": item.source,
-                "published_at": item.published_at,
-                "tags": json.dumps(item.tags, ensure_ascii=False),
-            }
-            for item in items
-        ]
-        try:
-            stmt = insert(StoredNews).values(rows).on_conflict_do_nothing(index_elements=["url"])
-            async with database.get_session() as session:
-                await session.execute(stmt)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Falha ao persistir notícias no banco: %s", exc)
+        return NewsBatch(merge_items(*groups), sources)
 
     async def _fetch_gdelt(self) -> list[NewsItem]:
         params = {

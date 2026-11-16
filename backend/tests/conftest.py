@@ -16,7 +16,12 @@ BASE_DAY = datetime(2026, 10, 1, 4, tzinfo=UTC)
 
 def isolated_settings() -> Settings:
     """Ignora o .env e as variáveis de ambiente de quem roda os testes."""
-    return Settings(_env_file=None, anthropic_api_key="", finnhub_api_key="")
+    return Settings(
+        _env_file=None,
+        watsonx_orchestrate_api_key="",
+        watsonx_orchestrate_access_token="",
+        finnhub_api_key="",
+    )
 
 
 def yahoo_payload(closes: list[float | None], market_price: float | None = None) -> dict:

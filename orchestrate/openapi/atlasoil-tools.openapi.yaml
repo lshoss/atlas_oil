@@ -1,0 +1,84 @@
+openapi: 3.0.3
+info:
+  title: AtlasOil Financial Tools
+  version: 1.0.0
+  description: Ferramentas somente leitura do agente AtlasOil.
+servers:
+  - url: https://YOUR_PUBLIC_BACKEND_URL/api
+security:
+  - AtlasOilToolKey: []
+paths:
+  /tools/get_quotes:
+    post:
+      operationId: get_quotes
+      summary: Consultar cotações dos ativos monitorados
+      responses:
+        '200':
+          description: Cotações e datas de referência
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+  /tools/get_history:
+    post:
+      operationId: get_history
+      summary: Consultar histórico diário de um ativo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, range]
+              properties:
+                symbol: { type: string, description: Símbolo exibido pelo AtlasOil }
+                range: { type: string, enum: [7d, 30d, 90d, 1a] }
+      responses:
+        '200':
+          description: Série histórica e metadados
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+  /tools/get_news:
+    post:
+      operationId: get_news
+      summary: Consultar notícias recentes do setor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit: { type: integer, minimum: 1, maximum: 10, default: 5 }
+      responses:
+        '200':
+          description: Notícias com fonte, URL, data e score de urgência
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+  /tools/get_analysis:
+    post:
+      operationId: get_analysis
+      summary: Reunir fatos para análise fundamentada de um ativo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, range]
+              properties:
+                symbol: { type: string, description: Símbolo exibido pelo AtlasOil }
+                range: { type: string, enum: [7d, 30d, 90d, 1a] }
+      responses:
+        '200':
+          description: Cotação, tendência, volatilidade, notícias e limitações
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+components:
+  securitySchemes:
+    AtlasOilToolKey:
+      type: apiKey
+      in: header
+      name: X-AtlasOil-Tool-Key

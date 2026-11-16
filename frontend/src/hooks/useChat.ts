@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { streamChat } from '../lib/api';
-import type { ApiMessage, UIContext, UiActionEvent } from '../lib/types';
+import type { ApiMessage } from '../lib/types';
 
-const STORAGE_KEY = 'barril.chat.v1';
+const OLD_KEY = 'barril.chat.v1';
+const STORAGE_KEY = 'atlasoil.chat.v1';
 const MAX_HISTORY = 20;
 
 export interface ChatEntry {
@@ -52,22 +53,19 @@ function createEntry(role: ChatEntry['role'], content: string, truncated = false
   return { id, role, content, ...(truncated && { truncated }) };
 }
 
-export interface UseChatOptions {
-  context?: UIContext;
-  onUiAction?: (event: UiActionEvent) => void;
-}
+export function useChat() {
+  // One-time migration: copy history from old key to new key on first load.
+  useEffect(() => {
+    if (!localStorage.getItem(STORAGE_KEY) && localStorage.getItem(OLD_KEY)) {
+      localStorage.setItem(STORAGE_KEY, localStorage.getItem(OLD_KEY)!);
+      localStorage.removeItem(OLD_KEY);
+    }
+  }, []);
 
-export function useChat({ context, onUiAction }: UseChatOptions = {}) {
   const [messages, setMessages] = useState<ChatEntry[]>(loadMessages);
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  // Keep latest callbacks in refs so the answer callback never goes stale
-  const contextRef = useRef(context);
-  const onUiActionRef = useRef(onUiAction);
-  useEffect(() => { contextRef.current = context; }, [context]);
-  useEffect(() => { onUiActionRef.current = onUiAction; }, [onUiAction]);
-
   const streaming = draft !== null;
 
   useEffect(() => saveMessages(messages), [messages]);
@@ -84,13 +82,22 @@ export function useChat({ context, onUiAction }: UseChatOptions = {}) {
     try {
       const { truncated } = await streamChat(
         toApiMessages(history),
-        contextRef.current,
         (delta) => {
           text += delta;
           setDraft(text);
         },
-        (event) => onUiActionRef.current?.(event),
         controller.signal,
+        (event) => {
+          for (const call of event.tool_calls ?? []) {
+            if (call.name !== 'get_analysis' && call.name !== 'get_history') continue;
+            const symbol = typeof call.args.symbol === 'string' ? call.args.symbol.toUpperCase() : '';
+            if (/^[A-Z0-9.^=-]{1,15}$/.test(symbol)) {
+              window.dispatchEvent(
+                new CustomEvent('atlasoil:symbol-selected', { detail: symbol }),
+              );
+            }
+          }
+        },
       );
       setMessages([...history, createEntry('assistant', text, truncated)]);
     } catch (cause) {
@@ -106,6 +113,12 @@ export function useChat({ context, onUiAction }: UseChatOptions = {}) {
     (text: string) => {
       const question = text.trim();
       if (!question || streaming) return;
+      const mentioned = question.match(/\b(?:BRENT|WTI|NG|PETR4|PRIO3|RECV3|USO|BNO)\b/i)?.[0];
+      if (mentioned) {
+        window.dispatchEvent(
+          new CustomEvent('atlasoil:symbol-selected', { detail: mentioned.toUpperCase() }),
+        );
+      }
       void answer([...messages, createEntry('user', question)]);
     },
     [answer, messages, streaming],
